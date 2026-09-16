@@ -193,8 +193,12 @@
   (proc/whereis :observe-local))
 
 (defn stop ()
-  "Stop the keeper, forgetting everything. Returns nil."
-  (let (p (pid)) (when p (gen/stop p)))
+  "Stop the keeper, forgetting everything. Returns nil. The name goes first, so `pid` is
+  nil the moment this returns — `gen/stop` itself is asynchronous."
+  (let (p (pid))
+    (when p
+      (proc/unregister :observe-local)
+      (gen/stop p)))
   nil)
 
 (defn clear ()

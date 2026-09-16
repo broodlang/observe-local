@@ -42,7 +42,10 @@
   (:alias web/conn)
   (:alias web/template)
   ; refresh-script — the same self-refresh the metrics dashboard has
-  (:alias web/dashboard))
+  (:alias web/dashboard)
+  ; picker / render-on / self-node? — a page for another machine is this page evaluated there
+  (:alias web/cluster)
+  (:alias url))
 
 ;; ---- caps ---------------------------------------------------------------------------------
 
@@ -278,7 +281,8 @@
     "a{color:#7aa2f7}.err{color:#f0776c}.warn{color:#e3b341}.dim{color:#5c6370}.info{color:#9ece6a}"
     "pre{background:#161a21;border:1px solid #232833;border-radius:8px;padding:.75rem 1rem;overflow-x:auto;white-space:pre-wrap}"
     ".tag{display:inline-block;background:#232833;border-radius:4px;padding:0 .4rem;margin-right:.3rem;font-size:.8rem}"
-    "footer{color:#5c6370;font-size:.75rem;margin-top:1.5rem}"))
+    "footer{color:#5c6370;font-size:.75rem;margin-top:1.5rem}"
+    ".picker{background:#161a21;color:#d7dae0;border:1px solid #232833;border-radius:6px;padding:.2rem .5rem;margin-left:1rem;font:inherit;text-transform:none;letter-spacing:0}"))
 
 (defn- when-at (ms)
   (if (int? ms) (datetime/format (datetime/epoch-ms-> ms) "%Y-%m-%d %H:%M:%S") "—"))
@@ -304,42 +308,54 @@
 (defn- level-class (level)
   (case level :error "err" :warn "warn" :info "info" "dim"))
 
-(defn- shell (prefix title section body &optional (refresh nil))
-  (web/template/render [:html
-                         {:lang "en"}
-                         [:head
-                           {}
-                           [:meta {:charset "utf-8"}]
-                           [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
-                           [:meta {:name "robots" :content "noindex, nofollow"}]
-                           [:title {} title]
-                           [:style {} (web/template/raw *styles*)]]
-                         [:body
-                           {}
-                           [:div
-                             {:class "wrap"}
-                             [:h1 {} title]
-                             [:nav
-                               {}
-                               (map [["" "overview"]
-                                      ["errors" "errors"]
-                                      ["logs" "logs"]
-                                      ["metrics" "metrics"]]
-                                 (fn (pair)
-                                   [:a
-                                     {:href (str prefix "/" (first pair))
-                                      :class (if (= (first pair) section) "on" "")}
-                                     (second pair)]))]
-                             body
-                             [:footer
-                               {}
-                               "What this process's observe shipper handed the local provider. In memory; a restart forgets."
-                               (if refresh
-                                 (str " Refreshes every " (math/quot refresh 1000) "s.")
-                                 "")]
-                             (if refresh (web/dashboard/refresh-script refresh) "")]]]))
+(defn- href (links path)
+  "A link inside the pages: `path` under the prefix, carrying the chosen machine along —
+  a click must not silently drop back to whichever machine answers."
+  (let (node (get links :node)
+        base (str (get links :prefix) path))
+    (if (nil? node)
+      base
+      (str base (if (< (index-of base "?") 0) "?" "&") (url/query-encode {"node" (str node)})))))
 
-(defn- overview (prefix state)
+(defn- shell (links title section body opts)
+  (let (refresh (get opts :refresh-ms))
+    (web/template/render [:html
+                           {:lang "en"}
+                           [:head
+                             {}
+                             [:meta {:charset "utf-8"}]
+                             [:meta
+                               {:name "viewport" :content "width=device-width, initial-scale=1"}]
+                             [:meta {:name "robots" :content "noindex, nofollow"}]
+                             [:title {} title]
+                             [:style {} (web/template/raw *styles*)]]
+                           [:body
+                             {}
+                             [:div
+                               {:class "wrap"}
+                               [:h1 {} title (web/cluster/picker (get opts :node))]
+                               (if (get opts :notice) [:p {:class "err"} (get opts :notice)] "")
+                               [:nav
+                                 {}
+                                 (map [["" "overview"]
+                                        ["errors" "errors"]
+                                        ["logs" "logs"]
+                                        ["metrics" "metrics"]]
+                                   (fn (pair)
+                                     [:a
+                                       {:href (href links (str "/" (first pair)))
+                                        :class (if (= (first pair) section) "on" "")}
+                                       (second pair)]))]
+                               body
+                               [:footer
+                                 {}
+                                 "What this process's observe shipper handed the local provider. In memory; a restart forgets."
+                                 (if refresh
+                                   (str " Refreshes every " (math/quot refresh 1000) "s.")
+                                   "")]
+                               (if refresh (web/dashboard/refresh-script refresh) "")]]])))
+
+(defn- overview (links state)
   (let (s (summary state)
         r (get s :received)
         now (os/now)
@@ -357,9 +373,9 @@
       [:h2 {} "recent errors"]
       (if (empty? groups)
         [:p {:class "dim"} "No errors received."]
-        (error-table prefix groups now))]))
+        (error-table links groups now))]))
 
-(defn- error-table (prefix groups now)
+(defn- error-table (links groups now)
   [:table
     {}
     [:thead {} [:tr {} [:th {} "error"] [:th {} "where"] [:th {} "n"] [:th {} "last"]]]
@@ -371,18 +387,18 @@
             {}
             [:td
               {}
-              [:a {:href (str prefix "/errors/" (get g :id)) :class "err"} (get g :name)]
+              [:a {:href (href links (str "/errors/" (get g :id))) :class "err"} (get g :name)]
               " "
               (get g :message)]
             [:td {:class "dim"} (str (get g :namespace) " " (or (get (get g :latest) :action) ""))]
             [:td {:class "n"} (str (get g :count))]
             [:td {:class "n dim"} (ago (get g :last) now)]]))]])
 
-(defn- errors-page (prefix state)
+(defn- errors-page (links state)
   (let (groups (errors state))
     (if (empty? groups)
       [:p {:class "dim"} "No errors received."]
-      (error-table prefix groups (os/now)))))
+      (error-table links groups (os/now)))))
 
 (defn- occurrence (report)
   [:div
@@ -402,7 +418,7 @@
         (str "\n\n" (string/join (map (get report :backtrace) (fn (f) (str "  at " f))) "\n")))]
     [:p {} (tags (get report :tags)) (tags (get report :params))]])
 
-(defn- error-page (prefix state id)
+(defn- error-page (links state id)
   (let (g (error-group id state))
     (if (nil? g)
       [:p {:class "dim"} "No such error group."]
@@ -418,7 +434,7 @@
         [:p {:class "dim"} (str "Last " (count (get g :occurrences)) " occurrences, newest first.")]
         (map (reverse (get g :occurrences)) occurrence)])))
 
-(defn- logs-page (prefix state level)
+(defn- logs-page (links state level)
   (let (records (logs {:level level :limit 200} state))
     [:div
       {}
@@ -428,7 +444,7 @@
         (map [:debug :info :warn :error]
           (fn (l)
             [:a
-              {:href (str prefix "/logs?level=" (string/substring (str l) 1))
+              {:href (href links (str "/logs?level=" (string/substring (str l) 1)))
                :class (if (= l level) "on" "")}
               (str (string/substring (str l) 1) " ")]))]
       (if (empty? records)
@@ -486,34 +502,44 @@
 
 (defn page (path &optional (opts {}))
   "The page for `path` — `\"\"`, `\"errors\"`, `\"errors/<id>\"`, `\"logs\"`, `\"metrics\"` —
-  as an HTML string, from a snapshot. `opts`: `:prefix` (default `\"/observe\"`), `:title`,
-  `:level` (the logs page's floor), `:refresh-ms` (the page keeps itself current — hatch's
-  `web/dashboard/refresh-script`), `:state` (a snapshot, for a test)."
-  (let (prefix (get opts :prefix "/observe")
+  as an HTML string, from a snapshot of this process, or of the machine `opts` `:node`
+  names, rendered there (`web/cluster/render-on`) with a picker of every machine when there
+  is more than one. `opts`: `:prefix` (default `\"/observe\"`), `:title`, `:level` (the logs
+  page's floor), `:refresh-ms` (the page keeps itself current — hatch's
+  `web/dashboard/refresh-script`), `:state` (a snapshot, for a test). Nil for a path that
+  is no page."
+  (if (web/cluster/self-node? (get opts :node))
+    (local-page path opts)
+    (web/cluster/render-on (get opts :node)
+      (fn () (observe-local/local-page path opts))
+      (fn (message) (local-page path (assoc opts :notice message))))))
+
+(defn local-page (path opts)
+  "`page`, for this process — what a peer evaluates on `render-on`."
+  (let (links {:prefix (get opts :prefix "/observe") :node (get opts :node)}
         title (get opts :title "observe")
-        refresh (get opts :refresh-ms)
         state (or (get opts :state) (snapshot))
         parts (seq/filter (string/split path "/") (fn (s) (not (= s ""))))
         section (or (first parts) ""))
     (cond
-      (= section "") (shell prefix title "" (overview prefix state) refresh)
+      (= section "") (shell links title "" (overview links state) opts)
       (and (= section "errors") (second parts))
-        (shell prefix title "errors" (error-page prefix state (second parts)) refresh)
-      (= section "errors") (shell prefix title "errors" (errors-page prefix state) refresh)
+        (shell links title "errors" (error-page links state (second parts)) opts)
+      (= section "errors") (shell links title "errors" (errors-page links state) opts)
       (= section "logs")
-        (shell prefix title "logs" (logs-page prefix state (get opts :level :debug)) refresh)
-      (= section "metrics") (shell prefix title "metrics" (metrics-page state) refresh)
+        (shell links title "logs" (logs-page links state (get opts :level :debug)) opts)
+      (= section "metrics") (shell links title "metrics" (metrics-page state) opts)
       :else nil)))
 
 (defn handler (&optional (opts {}))
   "A conn handler serving the pages. Mount it twice — on the prefix and on `<prefix>/*path`
   — behind whatever guards the metrics dashboard; `opts` as for `page`, with `:prefix`
-  naming where it is mounted."
+  naming where it is mounted. `?level=` picks the logs floor, `?node=` the machine."
   (fn (conn)
     (let (path (or (web/conn/param conn "path") "")
           level-param (web/conn/param conn "level")
           level (if (string? level-param) (keyword level-param) :debug)
-          html (page path (assoc opts :level level)))
+          html (page path (assoc opts :level level :node (web/conn/param conn "node"))))
       (if (nil? html)
         (web/conn/not-found-resp conn)
         (-> conn

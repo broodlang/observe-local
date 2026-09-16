@@ -180,3 +180,18 @@
     (let (html (page "logs" {:state (empty-state) :refresh-ms 4000}))
       (is (includes? html "var ms=4000"))
       (is (includes? html "Refreshes every 4s")))))
+
+(describe "cluster-aware"
+  (test "links carry the chosen machine, with the right separator"
+    (let (html (page "logs"
+                 {:state (add-log (empty-state) {:ts 1 :level :info :message "x" :meta {}})
+                  :node "hive@[fdaa::1]"
+                  :prefix "/dev/observe"}))
+      ;; the remote render fails on a lone runtime, so this is the fallback page with a notice
+      (is (includes? html "is not a connected peer"))
+      (is (includes? html "href=\"/dev/observe/errors?node=hive%40%5Bfdaa%3A%3A1%5D\""))
+      (is (includes? html "href=\"/dev/observe/logs?level=warn&amp;node=hive%40%5Bfdaa%3A%3A1%5D\""))))
+  (test "without a node the links are plain and there is no picker on one machine"
+    (let (html (page "" {:state (empty-state)}))
+      (is (includes? html "href=\"/observe/errors\""))
+      (is (not (includes? html "<select"))))))

@@ -38,7 +38,12 @@ Both at once in production:
 | `/observe/logs?level=warn` | the newest 200 lines at that level and above, with their structured meta |
 | `/observe/metrics` | every series (name + tags): count, last, p50, p95, max, sum over the recent samples |
 
-Self-contained — inline styles, no assets, no JavaScript, `noindex`.
+On more than one machine every page carries a machine picker (`?node=`): the page is
+rendered on the chosen peer (hatch's `web/cluster/render-on`) and every link keeps the
+choice. What it keeps is per process — the other machine is another store.
+
+Self-contained — inline styles, no assets, `noindex`; the only JavaScript is the picker
+and the refresh.
 
 ## What it keeps
 

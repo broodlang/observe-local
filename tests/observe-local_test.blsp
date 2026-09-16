@@ -173,3 +173,10 @@
                            {:ts 1 :level :info :message "<script>x</script>" :meta {}})}))
       (is (not (includes? html "<script>")))
       (is (includes? html "&lt;script&gt;")))))
+
+(describe "refresh"
+  (test "off by default, on with :refresh-ms"
+    (is (not (includes? (page "" {:state (empty-state)}) "<script")))
+    (let (html (page "logs" {:state (empty-state) :refresh-ms 4000}))
+      (is (includes? html "var ms=4000"))
+      (is (includes? html "Refreshes every 4s")))))

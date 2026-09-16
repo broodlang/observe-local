@@ -40,7 +40,9 @@
   (:alias string)
   (:alias datetime)
   (:alias web/conn)
-  (:alias web/template))
+  (:alias web/template)
+  ; refresh-script — the same self-refresh the metrics dashboard has
+  (:alias web/dashboard))
 
 ;; ---- caps ---------------------------------------------------------------------------------
 
@@ -302,7 +304,7 @@
 (defn- level-class (level)
   (case level :error "err" :warn "warn" :info "info" "dim"))
 
-(defn- shell (prefix title section body)
+(defn- shell (prefix title section body &optional (refresh nil))
   (web/template/render [:html
                          {:lang "en"}
                          [:head
@@ -331,7 +333,11 @@
                              body
                              [:footer
                                {}
-                               "What this process's observe shipper handed the local provider. In memory; a restart forgets."]]]]))
+                               "What this process's observe shipper handed the local provider. In memory; a restart forgets."
+                               (if refresh
+                                 (str " Refreshes every " (math/quot refresh 1000) "s.")
+                                 "")]
+                             (if refresh (web/dashboard/refresh-script refresh) "")]]]))
 
 (defn- overview (prefix state)
   (let (s (summary state)
@@ -481,20 +487,22 @@
 (defn page (path &optional (opts {}))
   "The page for `path` — `\"\"`, `\"errors\"`, `\"errors/<id>\"`, `\"logs\"`, `\"metrics\"` —
   as an HTML string, from a snapshot. `opts`: `:prefix` (default `\"/observe\"`), `:title`,
-  `:level` (the logs page's floor), `:state` (a snapshot, for a test)."
+  `:level` (the logs page's floor), `:refresh-ms` (the page keeps itself current — hatch's
+  `web/dashboard/refresh-script`), `:state` (a snapshot, for a test)."
   (let (prefix (get opts :prefix "/observe")
         title (get opts :title "observe")
+        refresh (get opts :refresh-ms)
         state (or (get opts :state) (snapshot))
         parts (seq/filter (string/split path "/") (fn (s) (not (= s ""))))
         section (or (first parts) ""))
     (cond
-      (= section "") (shell prefix title "" (overview prefix state))
+      (= section "") (shell prefix title "" (overview prefix state) refresh)
       (and (= section "errors") (second parts))
-        (shell prefix title "errors" (error-page prefix state (second parts)))
-      (= section "errors") (shell prefix title "errors" (errors-page prefix state))
+        (shell prefix title "errors" (error-page prefix state (second parts)) refresh)
+      (= section "errors") (shell prefix title "errors" (errors-page prefix state) refresh)
       (= section "logs")
-        (shell prefix title "logs" (logs-page prefix state (get opts :level :debug)))
-      (= section "metrics") (shell prefix title "metrics" (metrics-page state))
+        (shell prefix title "logs" (logs-page prefix state (get opts :level :debug)) refresh)
+      (= section "metrics") (shell prefix title "metrics" (metrics-page state) refresh)
       :else nil)))
 
 (defn handler (&optional (opts {}))

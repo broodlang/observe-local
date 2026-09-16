@@ -1,0 +1,510 @@
+;; observe-local — an `observe` provider that keeps everything in the app, with a page to
+;; read it: error_tracker's idea (errors in your own app, grouped, with a dashboard), for
+;; logs and metrics as well, and with no database. The point is to SEE what monitoring
+;; sees — every event the shipper would hand a vendor, exactly as it would hand it — on a
+;; laptop with nothing configured, or in production as a second opinion next to the vendor
+;; (`observe/fan-out-provider`).
+;;
+;; Design notes (the *why*; the *what* is in the docstrings):
+;;  - **One process holds one immutable state value; every batch is a cast.** Brood's own
+;;    answer to "a store that changes": no database, no table, nothing to migrate, and the
+;;    provider costs the shipper a `send`. The page renders from a snapshot (a `query`) and
+;;    holds nothing open.
+;;  - **Everything is bounded, because it lives in memory.** Errors are grouped by name and
+;;    first message line (error_tracker fingerprints the same way) and each group keeps its
+;;    last few occurrences; logs are a ring of the newest lines; metrics are rolled up per
+;;    name+tags with a ring of recent samples for the percentiles. Past each cap the oldest
+;;    goes — the same policy as the shipper's own buffers, for the same reason.
+;;  - **Not persistence.** A restart forgets. That is a trade made on purpose for zero
+;;    setup; a `store`-backed twin with the same query surface is the obvious next step
+;;    and would replace only the process, not the page.
+(defmodule observe-local
+  "An `observe` provider that keeps logs, metrics and errors in this process, and a page
+  that shows them.
+
+      (observe/start {:provider (observe-local/provider) :app \"hive\" :env \"dev\"})
+      (observe/attach-all)
+      ;; in the router, behind an allow-list like the metrics dashboard:
+      (get \"/observe\" (observe-local/handler))
+      (get \"/observe/*path\" (observe-local/handler))
+
+  Or both at once in production: `(observe/fan-out-provider [(observe-local/provider)
+  (observe-appsignal/provider {…})])`."
+  (:use observe :only [Provider])
+  (:alias observe)
+  (:alias gen)
+  (:alias proc)
+  (:alias math)
+  (:alias stats)
+  (:alias seq)
+  (:alias string)
+  (:alias datetime)
+  (:alias web/conn)
+  (:alias web/template))
+
+;; ---- caps ---------------------------------------------------------------------------------
+
+(def *max-error-groups* 200)
+(def *max-occurrences* 20)
+(def *max-logs* 500)
+(def *max-metric-keys* 500)
+(def *max-samples* 200)
+
+;; ---- the state (pure) ---------------------------------------------------------------------
+
+(defn empty-state ()
+  "A fresh store: nothing seen, started now."
+  {:errors {}
+   :next-id 1
+   :logs []
+   :metrics {}
+   :received {:logs 0 :metrics 0 :errors 0}
+   :batches 0
+   :started-at (os/now)})
+
+(defn- ring (items item cap)
+  "`items` with `item` appended, keeping the newest `cap`."
+  (let (grown (conj items item))
+    (if (> (count grown) cap) (vec (seq/take-last grown cap)) grown)))
+
+(defn- first-line (s)
+  (first (string/split (str s) "\n")))
+
+(defn group-key (report)
+  "What makes two reports the same error: the name and the first line of the message."
+  [(str (get report :name "error")) (first-line (get report :message ""))])
+
+(defn- evict-oldest-group (groups)
+  "Drop the group least recently seen — the one a reader is least likely to be looking for."
+  (let (oldest (first (sort-by (vals groups) (fn (g) (get g :last)))))
+    (dissoc groups (get oldest :key))))
+
+(defn add-error (state report)
+  "`state` with `report` folded into its group: a new group past the cap evicts the least
+  recently seen one."
+  (let (key (group-key report)
+        groups (get state :errors)
+        existing (get groups key)
+        now (get report :ts (os/now))
+        group (if existing
+                (assoc existing
+                  :count (+ (get existing :count) 1)
+                  :last now
+                  :latest report
+                  :occurrences (ring (get existing :occurrences) report *max-occurrences*))
+                {:id (get state :next-id)
+                 :key key
+                 :name (first key)
+                 :message (second key)
+                 :namespace (get report :namespace "app")
+                 :count 1
+                 :first now
+                 :last now
+                 :latest report
+                 :occurrences [report]})
+        trimmed (if (and (nil? existing) (>= (count groups) *max-error-groups*))
+                  (evict-oldest-group groups)
+                  groups))
+    (assoc state
+      :errors (assoc trimmed key group)
+      :next-id (if existing (get state :next-id) (+ (get state :next-id) 1)))))
+
+(defn add-log (state record)
+  (assoc state :logs (ring (get state :logs) record *max-logs*)))
+
+(defn metric-key (metric)
+  [(str (get metric :name)) (or (get metric :tags) {})])
+
+(defn add-metric (state metric)
+  "`state` with `metric` rolled into its name+tags series; a new series past the cap is
+  dropped rather than evicting — a series is a fact about the app, not a moment."
+  (let (key (metric-key metric)
+        series (get state :metrics)
+        existing (get series key)
+        value (get metric :value 0)
+        now (get metric :ts (os/now)))
+    (cond
+      existing
+        (assoc state
+          :metrics
+            (assoc series
+              key
+                (assoc existing
+                  :count (+ (get existing :count) 1)
+                  :last value
+                  :last-at now
+                  :sum (+ (get existing :sum) value)
+                  :min (math/min (get existing :min) value)
+                  :max (math/max (get existing :max) value)
+                  :samples (ring (get existing :samples) value *max-samples*))))
+      (< (count series) *max-metric-keys*)
+        (assoc state
+          :metrics
+            (assoc series
+              key
+                {:key key
+                 :name (first key)
+                 :tags (second key)
+                 :kind (get metric :kind :gauge)
+                 :count 1
+                 :last value
+                 :last-at now
+                 :sum value
+                 :min value
+                 :max value
+                 :samples [value]}))
+      :else state)))
+
+(defn receive-batch (state kind batch)
+  "`state` after one shipped batch of `kind`."
+  (let (folded (case kind
+                 :errors (fold batch state add-error)
+                 :logs (fold batch state add-log)
+                 :metrics (fold batch state add-metric)
+                 state)
+        received (get folded :received))
+    (assoc folded
+      :batches (+ (get folded :batches) 1)
+      :received (assoc received kind (+ (get received kind 0) (count batch))))))
+
+;; ---- the process ----------------------------------------------------------------------------
+
+(gen/defserver keeper
+  (state)
+  "Holds the store; batches arrive as casts, the page reads a snapshot."
+  (cast [:batch kind batch] (receive-batch state kind batch))
+  (cast :clear (empty-state))
+  (query :snapshot state))
+
+(defn start ()
+  "Start the keeper, registered as `:observe-local`; idempotent. Returns its pid."
+  (or (proc/whereis :observe-local)
+    (let (pid (gen/start keeper (empty-state)))
+      (proc/register :observe-local pid)
+      pid)))
+
+(defn pid ()
+  "The keeper's pid, or nil."
+  (proc/whereis :observe-local))
+
+(defn stop ()
+  "Stop the keeper, forgetting everything. Returns nil."
+  (let (p (pid)) (when p (gen/stop p)))
+  nil)
+
+(defn clear ()
+  "Forget everything, keep running."
+  (let (p (pid)) (when p (gen/cast p :clear)))
+  nil)
+
+(defn snapshot ()
+  "The whole state, or an empty one when the keeper is not running."
+  (let (p (pid)) (if p (gen/call p :snapshot) (empty-state))))
+
+;; ---- the provider ---------------------------------------------------------------------------
+
+(defrecord local (pid))
+
+(impl Provider
+  local
+  (ship-logs [p _ records] (do (gen/cast (get p :pid) [:batch :logs records]) :ok))
+  (ship-metrics [p _ metrics] (do (gen/cast (get p :pid) [:batch :metrics metrics]) :ok))
+  (ship-errors [p _ reports] (do (gen/cast (get p :pid) [:batch :errors reports]) :ok)))
+
+(defn provider ()
+  "The local provider, over a running keeper (started if need be)."
+  (local (start)))
+
+;; ---- queries ----------------------------------------------------------------------------------
+
+(defn errors (&optional (state nil))
+  "Every error group, most recently seen first."
+  (reverse (sort-by (vals (get (or state (snapshot)) :errors)) (fn (g) (get g :last)))))
+
+(defn error-group (id &optional (state nil))
+  "The group with `id`, or nil."
+  (first (seq/filter (vals (get (or state (snapshot)) :errors))
+           (fn (g) (= (str (get g :id)) (str id))))))
+
+(defn logs (&optional (opts {}) (state nil))
+  "The newest log records, newest first. `opts`: `:level` (only that level and above),
+  `:limit` (default 200)."
+  (let (ranks {:debug 0 :info 1 :warn 2 :error 3}
+        floor (get ranks (get opts :level :debug) 0)
+        kept (seq/filter (get (or state (snapshot)) :logs)
+               (fn (r) (>= (get ranks (get r :level) 1) floor))))
+    (vec (take (reverse kept) (get opts :limit 200)))))
+
+(defn percentile (series p)
+  "The `p`th percentile of a series' recent samples, rounded."
+  (let (samples (get series :samples))
+    (if (empty? samples) 0 (math/round-to (stats/percentile samples p) 2))))
+
+(defn metrics (&optional (state nil))
+  "Every metric series, by name then tags."
+  (sort-by (vals (get (or state (snapshot)) :metrics))
+    (fn (s) [(get s :name) (pr-str (get s :tags))])))
+
+(defn summary (&optional (state nil))
+  "The counts on the overview: what was received, how many groups and series exist."
+  (let (s (or state (snapshot)))
+    {:received (get s :received)
+     :batches (get s :batches)
+     :error-groups (count (get s :errors))
+     :series (count (get s :metrics))
+     :logs (count (get s :logs))
+     :started-at (get s :started-at)}))
+
+;; ---- the page -----------------------------------------------------------------------------------
+
+(def- *styles*
+  (str "body{font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0;"
+    "background:#0f1115;color:#d7dae0}" ".wrap{max-width:72rem;margin:0 auto;padding:2rem 1.25rem}"
+    "h1{font-size:1.1rem;letter-spacing:.08em;text-transform:uppercase;color:#8b93a1;margin:0 0 1rem}"
+    "nav{margin-bottom:1.5rem}nav a{color:#8b93a1;margin-right:1rem;text-decoration:none}"
+    "nav a.on,nav a:hover{color:#d7dae0}"
+    ".cards{display:flex;flex-wrap:wrap;gap:.75rem;margin-bottom:1.5rem}"
+    ".card{background:#161a21;border:1px solid #232833;border-radius:8px;padding:.75rem 1rem;min-width:7rem}"
+    ".card b{display:block;font-size:1.5rem;font-weight:600}"
+    ".card span{color:#8b93a1;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em}"
+    "h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;color:#8b93a1;margin:1.5rem 0 .6rem;font-weight:600}"
+    "table{width:100%;border-collapse:collapse}"
+    "th{text-align:left;font-weight:500;color:#8b93a1;font-size:.75rem;text-transform:uppercase;"
+    "letter-spacing:.06em;padding:.5rem .6rem;border-bottom:1px solid #232833}"
+    "td{padding:.45rem .6rem;border-bottom:1px solid #1a1e26;vertical-align:top}"
+    "td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}"
+    "a{color:#7aa2f7}.err{color:#f0776c}.warn{color:#e3b341}.dim{color:#5c6370}.info{color:#9ece6a}"
+    "pre{background:#161a21;border:1px solid #232833;border-radius:8px;padding:.75rem 1rem;overflow-x:auto;white-space:pre-wrap}"
+    ".tag{display:inline-block;background:#232833;border-radius:4px;padding:0 .4rem;margin-right:.3rem;font-size:.8rem}"
+    "footer{color:#5c6370;font-size:.75rem;margin-top:1.5rem}"))
+
+(defn- when-at (ms)
+  (if (int? ms) (datetime/format (datetime/epoch-ms-> ms) "%Y-%m-%d %H:%M:%S") "—"))
+
+(defn- ago (ms now)
+  (let (s (math/quot (math/floor (- now ms)) 1000))
+    (cond
+      (< s 60) (str s "s ago")
+      (< s 3600) (str (math/quot s 60) "m ago")
+      (< s 86400) (str (math/quot s 3600) "h ago")
+      :else (str (math/quot s 86400) "d ago"))))
+
+(defn- card (label value &optional (class ""))
+  [:div {:class "card"} [:b {:class class} (str value)] [:span {} label]])
+
+(defn- tags (m)
+  (map (or m {}) (fn (pair) [:span {:class "tag"} (str (first pair) "=" (second pair))])))
+
+(defn- level-class (level)
+  (case level :error "err" :warn "warn" :info "info" "dim"))
+
+(defn- shell (prefix title section body)
+  (web/template/render [:html
+                         {:lang "en"}
+                         [:head
+                           {}
+                           [:meta {:charset "utf-8"}]
+                           [:meta {:name "viewport" :content "width=device-width, initial-scale=1"}]
+                           [:meta {:name "robots" :content "noindex, nofollow"}]
+                           [:title {} title]
+                           [:style {} (web/template/raw *styles*)]]
+                         [:body
+                           {}
+                           [:div
+                             {:class "wrap"}
+                             [:h1 {} title]
+                             [:nav
+                               {}
+                               (map [["" "overview"]
+                                      ["errors" "errors"]
+                                      ["logs" "logs"]
+                                      ["metrics" "metrics"]]
+                                 (fn (pair)
+                                   [:a
+                                     {:href (str prefix "/" (first pair))
+                                      :class (if (= (first pair) section) "on" "")}
+                                     (second pair)]))]
+                             body
+                             [:footer
+                               {}
+                               "What this process's observe shipper handed the local provider. In memory; a restart forgets."]]]]))
+
+(defn- overview (prefix state)
+  (let (s (summary state)
+        r (get s :received)
+        now (os/now)
+        groups (take (errors state) 10))
+    [:div
+      {}
+      [:div
+        {:class "cards"}
+        (card "errors" (get r :errors) (if (> (get r :errors) 0) "err" ""))
+        (card "error groups" (get s :error-groups))
+        (card "log lines" (get r :logs))
+        (card "metrics" (get r :metrics))
+        (card "series" (get s :series))
+        (card "batches" (get s :batches) "dim")]
+      [:h2 {} "recent errors"]
+      (if (empty? groups)
+        [:p {:class "dim"} "No errors received."]
+        (error-table prefix groups now))]))
+
+(defn- error-table (prefix groups now)
+  [:table
+    {}
+    [:thead {} [:tr {} [:th {} "error"] [:th {} "where"] [:th {} "n"] [:th {} "last"]]]
+    [:tbody
+      {}
+      (map groups
+        (fn (g)
+          [:tr
+            {}
+            [:td
+              {}
+              [:a {:href (str prefix "/errors/" (get g :id)) :class "err"} (get g :name)]
+              " "
+              (get g :message)]
+            [:td {:class "dim"} (str (get g :namespace) " " (or (get (get g :latest) :action) ""))]
+            [:td {:class "n"} (str (get g :count))]
+            [:td {:class "n dim"} (ago (get g :last) now)]]))]])
+
+(defn- errors-page (prefix state)
+  (let (groups (errors state))
+    (if (empty? groups)
+      [:p {:class "dim"} "No errors received."]
+      (error-table prefix groups (os/now)))))
+
+(defn- occurrence (report)
+  [:div
+    {}
+    [:h2
+      {}
+      (str (when-at (get report :ts))
+        " · "
+        (or (get report :action) "")
+        " · "
+        (get report :namespace))]
+    [:pre
+      {}
+      (get report :message)
+      (if (empty? (get report :backtrace []))
+        ""
+        (str "\n\n" (string/join (map (get report :backtrace) (fn (f) (str "  at " f))) "\n")))]
+    [:p {} (tags (get report :tags)) (tags (get report :params))]])
+
+(defn- error-page (prefix state id)
+  (let (g (error-group id state))
+    (if (nil? g)
+      [:p {:class "dim"} "No such error group."]
+      [:div
+        {}
+        [:div
+          {:class "cards"}
+          (card "seen" (get g :count) "err")
+          (card "first" (when-at (get g :first)) "dim")
+          (card "last" (when-at (get g :last)) "dim")
+          (card "namespace" (get g :namespace) "dim")]
+        [:p {} [:b {:class "err"} (get g :name)] " " (get g :message)]
+        [:p {:class "dim"} (str "Last " (count (get g :occurrences)) " occurrences, newest first.")]
+        (map (reverse (get g :occurrences)) occurrence)])))
+
+(defn- logs-page (prefix state level)
+  (let (records (logs {:level level :limit 200} state))
+    [:div
+      {}
+      [:p
+        {:class "dim"}
+        "Level: "
+        (map [:debug :info :warn :error]
+          (fn (l)
+            [:a
+              {:href (str prefix "/logs?level=" (string/substring (str l) 1))
+               :class (if (= l level) "on" "")}
+              (str (string/substring (str l) 1) " ")]))]
+      (if (empty? records)
+        [:p {:class "dim"} "No log lines received."]
+        [:table
+          {}
+          [:thead {} [:tr {} [:th {} "when"] [:th {} "level"] [:th {} "message"] [:th {} "meta"]]]
+          [:tbody
+            {}
+            (map records
+              (fn (r)
+                [:tr
+                  {}
+                  [:td {:class "n dim"} (when-at (get r :ts))]
+                  [:td
+                    {:class (level-class (get r :level))}
+                    (string/substring (str (get r :level)) 1)]
+                  [:td {} (str (get r :message))]
+                  [:td {} (tags (get r :meta))]]))]])]))
+
+(defn- metrics-page (state)
+  (let (series (metrics state))
+    (if (empty? series)
+      [:p {:class "dim"} "No metrics received."]
+      [:table
+        {}
+        [:thead
+          {}
+          [:tr
+            {}
+            [:th {} "metric"]
+            [:th {} "tags"]
+            [:th {} "kind"]
+            [:th {} "n"]
+            [:th {} "last"]
+            [:th {} "p50"]
+            [:th {} "p95"]
+            [:th {} "max"]
+            [:th {} "sum"]]]
+        [:tbody
+          {}
+          (map series
+            (fn (s)
+              [:tr
+                {}
+                [:td {} (get s :name)]
+                [:td {} (tags (get s :tags))]
+                [:td {:class "dim"} (string/substring (str (get s :kind)) 1)]
+                [:td {:class "n"} (str (get s :count))]
+                [:td {:class "n"} (str (get s :last))]
+                [:td {:class "n"} (str (percentile s 50))]
+                [:td {:class "n"} (str (percentile s 95))]
+                [:td {:class "n"} (str (get s :max))]
+                [:td {:class "n dim"} (str (math/round-to (get s :sum) 2))]]))]])))
+
+(defn page (path &optional (opts {}))
+  "The page for `path` — `\"\"`, `\"errors\"`, `\"errors/<id>\"`, `\"logs\"`, `\"metrics\"` —
+  as an HTML string, from a snapshot. `opts`: `:prefix` (default `\"/observe\"`), `:title`,
+  `:level` (the logs page's floor), `:state` (a snapshot, for a test)."
+  (let (prefix (get opts :prefix "/observe")
+        title (get opts :title "observe")
+        state (or (get opts :state) (snapshot))
+        parts (seq/filter (string/split path "/") (fn (s) (not (= s ""))))
+        section (or (first parts) ""))
+    (cond
+      (= section "") (shell prefix title "" (overview prefix state))
+      (and (= section "errors") (second parts))
+        (shell prefix title "errors" (error-page prefix state (second parts)))
+      (= section "errors") (shell prefix title "errors" (errors-page prefix state))
+      (= section "logs")
+        (shell prefix title "logs" (logs-page prefix state (get opts :level :debug)))
+      (= section "metrics") (shell prefix title "metrics" (metrics-page state))
+      :else nil)))
+
+(defn handler (&optional (opts {}))
+  "A conn handler serving the pages. Mount it twice — on the prefix and on `<prefix>/*path`
+  — behind whatever guards the metrics dashboard; `opts` as for `page`, with `:prefix`
+  naming where it is mounted."
+  (fn (conn)
+    (let (path (or (web/conn/param conn "path") "")
+          level-param (web/conn/param conn "level")
+          level (if (string? level-param) (keyword level-param) :debug)
+          html (page path (assoc opts :level level)))
+      (if (nil? html)
+        (web/conn/not-found-resp conn)
+        (-> conn
+          (web/conn/put-resp-header :cache-control "no-store")
+          (web/conn/put-resp-header :content-type "text/html; charset=utf-8")
+          (web/conn/send-resp 200 html))))))

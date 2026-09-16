@@ -1,0 +1,174 @@
+;; The store's folds (pure), the keeper through the provider, and the pages from a snapshot.
+;; The keeper is one registered process, so the groups that start it are `:isolated`.
+(defmodule observe-local-test
+  (:use test)
+  (:use observe-local)
+  (:alias observe))
+
+(defn- report (name message &optional (extra {}))
+  (merge {:ts 1700000000000
+          :level :error
+          :name name
+          :message message
+          :backtrace []
+          :action "GET /x"
+          :namespace "web"
+          :tags {}
+          :params {}}
+    extra))
+
+(describe "add-error"
+  (test "groups by name and the first message line"
+    (let (s (-> (empty-state)
+              (add-error (report "db/insert" "db/insert: down\nat a"))
+              (add-error (report "db/insert" "db/insert: down\nat b"))
+              (add-error (report "E0030" "+: expected number"))))
+      (assert= 2 (count (get s :errors)))
+      (let (g (first (errors s)))
+        (assert= "E0030" (get g :name)))
+      (let (g (error-group 1 s))
+        (assert= "db/insert" (get g :name))
+        (assert= "db/insert: down" (get g :message))
+        (assert= 2 (get g :count))
+        (assert= 2 (count (get g :occurrences))))))
+
+  (test "ids are stable and grow only with new groups"
+    (let (s (-> (empty-state)
+              (add-error (report "a" "a"))
+              (add-error (report "a" "a"))
+              (add-error (report "b" "b"))))
+      (assert= 1 (get (error-group 1 s) :id))
+      (assert= "b" (get (error-group 2 s) :name))
+      (assert= nil (error-group 3 s))))
+
+  (test "a group keeps only its newest occurrences"
+    (let (s (fold (range 0 30) (empty-state) (fn (acc i) (add-error acc (report "a" "a" {:ts i}))))
+          g (error-group 1 s))
+      (assert= 30 (get g :count))
+      (assert= *max-occurrences* (count (get g :occurrences)))
+      (assert= 29 (get (last (get g :occurrences)) :ts))))
+
+  (test "past the cap the least recently seen group goes"
+    (let (s (fold (range 0 (+ *max-error-groups* 1))
+              (empty-state)
+              (fn (acc i) (add-error acc (report (str "e" i) "m" {:ts i})))))
+      (assert= *max-error-groups* (count (get s :errors)))
+      (assert= nil (error-group 1 s))
+      (is (not (nil? (error-group 2 s)))))))
+
+(describe "add-log and logs"
+  (test "newest first, filtered by level"
+    (let (s (-> (empty-state)
+              (add-log {:ts 1 :level :debug :message "d" :meta {}})
+              (add-log {:ts 2 :level :info :message "i" :meta {}})
+              (add-log {:ts 3 :level :error :message "e" :meta {}})))
+      (assert= ["e" "i" "d"] (vec (map (logs {} s) (fn (r) (get r :message)))))
+      (assert= ["e" "i"] (vec (map (logs {:level :info} s) (fn (r) (get r :message)))))
+      (assert= ["e"] (vec (map (logs {:limit 1} s) (fn (r) (get r :message)))))))
+
+  (test "a ring of the newest lines"
+    (let (s (fold (range 0 (+ *max-logs* 5))
+              (empty-state)
+              (fn (acc i) (add-log acc {:ts i :level :info :message (str i) :meta {}}))))
+      (assert= *max-logs* (count (get s :logs)))
+      (assert= (str (+ *max-logs* 4)) (get (first (logs {} s)) :message)))))
+
+(describe "add-metric and metrics"
+  (test "rolls up per name and tags"
+    (let (s (-> (empty-state)
+              (add-metric {:ts 1
+                           :name "request_duration"
+                           :kind :timing
+                           :value 10
+                           :tags {:route "/"}})
+              (add-metric {:ts 2
+                           :name "request_duration"
+                           :kind :timing
+                           :value 30
+                           :tags {:route "/"}})
+              (add-metric {:ts 3
+                           :name "request_duration"
+                           :kind :timing
+                           :value 5
+                           :tags {:route "/x"}})))
+      (assert= 2 (count (metrics s)))
+      (let (root (first (seq/filter (metrics s) (fn (m) (= (get m :tags) {:route "/"})))))
+        (assert= 2 (get root :count))
+        (assert= 30 (get root :last))
+        (assert= 40 (get root :sum))
+        (assert= 10 (get root :min))
+        (assert= 30 (get root :max))
+        (assert= 30 (percentile root 95)))))
+
+  (test "a new series past the cap is dropped, an existing one still counts"
+    (let (s (fold (range 0 (+ *max-metric-keys* 1))
+              (empty-state)
+              (fn (acc i) (add-metric acc {:ts i :name (str "m" i) :kind :gauge :value i :tags {}})))
+          s2 (add-metric s {:ts 9 :name "m0" :kind :gauge :value 9 :tags {}}))
+      (assert= *max-metric-keys* (count (get s :metrics)))
+      (assert= 2 (get (get (get s2 :metrics) ["m0" {}]) :count)))))
+
+(describe "receive-batch"
+  (test "counts what arrived"
+    (let (s (-> (empty-state)
+              (receive-batch :logs [{:ts 1 :level :info :message "a" :meta {}}])
+              (receive-batch :errors [(report "a" "a") (report "b" "b")])))
+      (assert= {:logs 1 :metrics 0 :errors 2} (get s :received))
+      (assert= 2 (get s :batches)))))
+
+(describe "the provider through observe"
+  :isolated (test "what the shipper hands over is what the keeper holds"
+    (stop)
+    (observe/start {:provider (provider) :flush-ms 60000 :env "test" :app "t"})
+    (observe/report "worker/step: bad" {:action "job"})
+    (observe/gauge "pool" 3 {:pool "pg"})
+    (observe/flush-sync)
+    (let (s (snapshot))
+      (assert= 1 (count (errors s)))
+      (assert= "worker/step" (get (first (errors s)) :name))
+      (assert= 1 (count (metrics s)))
+      (assert= {:errors 1 :metrics 1 :logs 0} (get (summary s) :received)))
+    (clear)
+    (assert= 0 (count (errors)))
+    (observe/stop)
+    (stop)))
+
+(describe "pages"
+  (defn- state ()
+    (-> (empty-state)
+      (add-error (report "db/insert"
+                   "db/insert: down"
+                   {:backtrace ["src/db.blsp:3:1" "db/insert"] :tags {:method "POST"}}))
+      (add-log {:ts 1700000000000 :level :warn :message "disk low" :meta {:path "/x"}})
+      (add-metric {:ts 1 :name "request_duration" :kind :timing :value 12 :tags {:route "/"}})))
+
+  (test "the overview lists the counts and the recent errors"
+    (let (html (page "" {:state (state)}))
+      (is (includes? html "db/insert"))
+      (is (includes? html "error groups"))
+      (is (includes? html "href=\"/observe/errors/1\""))))
+
+  (test "the error page shows the occurrence with its backtrace and tags"
+    (let (html (page "errors/1" {:state (state)}))
+      (is (includes? html "at src/db.blsp:3:1"))
+      (is (includes? html "method=POST"))
+      (is (includes? html "db/insert: down"))))
+
+  (test "an unknown error id is a page saying so"
+    (is (includes? (page "errors/99" {:state (state)}) "No such error group")))
+
+  (test "logs and metrics render, and the prefix is honoured"
+    (is (includes? (page "logs" {:state (state)}) "disk low"))
+    (is (includes? (page "logs" {:state (state) :level :error}) "No log lines"))
+    (is (includes? (page "metrics" {:state (state)}) "request_duration"))
+    (is (includes? (page "" {:state (state) :prefix "/ops"}) "href=\"/ops/errors\"")))
+
+  (test "an unknown section is nil, for the handler's 404"
+    (assert= nil (page "nope" {:state (state)})))
+
+  (test "everything is escaped"
+    (let (html (page "logs"
+                 {:state (add-log (empty-state)
+                           {:ts 1 :level :info :message "<script>x</script>" :meta {}})}))
+      (is (not (includes? html "<script>")))
+      (is (includes? html "&lt;script&gt;")))))

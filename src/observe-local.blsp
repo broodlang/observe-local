@@ -292,8 +292,12 @@
 (defn- card (label value &optional (class ""))
   [:div {:class "card"} [:b {:class class} (str value)] [:span {} label]])
 
+(defn- tag-name (k)
+  ;; `:route` reads as `route=`; a keyword's colon is Brood's, not the reader's
+  (if (keyword? k) (string/substring (str k) 1) (str k)))
+
 (defn- tags (m)
-  (map (or m {}) (fn (pair) [:span {:class "tag"} (str (first pair) "=" (second pair))])))
+  (map (or m {}) (fn (pair) [:span {:class "tag"} (str (tag-name (first pair)) "=" (second pair))])))
 
 (defn- level-class (level)
   (case level :error "err" :warn "warn" :info "info" "dim"))

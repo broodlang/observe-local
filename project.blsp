@@ -11,7 +11,9 @@
   ;; Both pinned by commit until they are on the registry; hatch is what the
   ;; page renders and serves with (`web/template`, `web/conn`).
   :dependencies
-    [[observe :git "https://github.com/broodlang/observe.git" :ref "8ae735f4a22349a87c06c9be726e279dc7edc5e6"]
+    [[observe
+       :git "https://github.com/broodlang/observe.git"
+       :ref "9bcd1a88eb4a7d65e204ae9eacb7bec29e5218a5"]
       [hatch
         :git "https://github.com/broodlang/hatch.git"
-        :ref "66158fdff883a0b996320f76d5f23b9ed55adad6"]])
+        :ref "f482eda2a41e5c2db7004d15010b29d1767bbcee"]])

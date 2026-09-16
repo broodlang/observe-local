@@ -152,6 +152,7 @@
     (let (html (page "errors/1" {:state (state)}))
       (is (includes? html "at src/db.blsp:3:1"))
       (is (includes? html "method=POST"))
+      (is (not (includes? html ":method=")))
       (is (includes? html "db/insert: down"))))
 
   (test "an unknown error id is a page saying so"

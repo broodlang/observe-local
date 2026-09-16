@@ -8,12 +8,5 @@
   :description
     "An observe provider that keeps logs, metrics and errors in-process, grouped and bounded, with a hatch page to read them — error_tracker's idea, for everything, without a database."
   :repository "https://github.com/broodlang/observe-local"
-  ;; Both pinned by commit until they are on the registry; hatch is what the
-  ;; page renders and serves with (`web/template`, `web/conn`).
-  :dependencies
-    [[observe
-       :git "https://github.com/broodlang/observe.git"
-       :ref "9bcd1a88eb4a7d65e204ae9eacb7bec29e5218a5"]
-      [hatch
-        :git "https://github.com/broodlang/hatch.git"
-        :ref "0d92b804bba429f5f27d72d80154ad69a32d3801"]])
+  ;; hatch is what the page renders and serves with (`web/template`, `web/conn`).
+  :dependencies [[observe :version "^0.1.0"] [hatch :version "^0.23.0"]])

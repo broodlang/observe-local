@@ -534,15 +534,18 @@
 (defn handler (&optional (opts {}))
   "A conn handler serving the pages. Mount it twice — on the prefix and on `<prefix>/*path`
   — behind whatever guards the metrics dashboard; `opts` as for `page`, with `:prefix`
-  naming where it is mounted. `?level=` picks the logs floor, `?node=` the machine."
+  naming where it is mounted. `?level=` picks the logs floor, `?node=` the machine — and in
+  a cluster a request naming none is redirected to this one (`web/cluster/pinned`), so a
+  refreshing page never flips between machines."
   (fn (conn)
-    (let (path (or (web/conn/param conn "path") "")
-          level-param (web/conn/param conn "level")
-          level (if (string? level-param) (keyword level-param) :debug)
-          html (page path (assoc opts :level level :node (web/conn/param conn "node"))))
-      (if (nil? html)
-        (web/conn/not-found-resp conn)
-        (-> conn
-          (web/conn/put-resp-header :cache-control "no-store")
-          (web/conn/put-resp-header :content-type "text/html; charset=utf-8")
-          (web/conn/send-resp 200 html))))))
+    (or (web/cluster/pinned conn)
+      (let (path (or (web/conn/param conn "path") "")
+            level-param (web/conn/param conn "level")
+            level (if (string? level-param) (keyword level-param) :debug)
+            html (page path (assoc opts :level level :node (web/conn/param conn "node"))))
+        (if (nil? html)
+          (web/conn/not-found-resp conn)
+          (-> conn
+            (web/conn/put-resp-header :cache-control "no-store")
+            (web/conn/put-resp-header :content-type "text/html; charset=utf-8")
+            (web/conn/send-resp 200 html)))))))

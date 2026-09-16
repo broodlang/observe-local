@@ -16,4 +16,4 @@
        :ref "9bcd1a88eb4a7d65e204ae9eacb7bec29e5218a5"]
       [hatch
         :git "https://github.com/broodlang/hatch.git"
-        :ref "c6a34bb765600ddd9653a4f90c157d7c27b8ff1a"]])
+        :ref "0d92b804bba429f5f27d72d80154ad69a32d3801"]])

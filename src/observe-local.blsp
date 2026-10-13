@@ -30,7 +30,6 @@
 
   Or both at once in production: `(observe/fan-out-provider [(observe-local/provider)
   (observe-appsignal/provider {…})])`."
-  (:use observe :only [Provider])
   (:alias observe)
   (:alias gen)
   (:alias proc)

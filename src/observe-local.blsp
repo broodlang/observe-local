@@ -80,7 +80,7 @@
 
 (defn- evict-oldest-group (groups)
   "Drop the group least recently seen — the one a reader is least likely to be looking for."
-  (let (oldest (first (sort-by (vals groups) (fn (g) (get g :last)))))
+  (let (oldest (first (seq/sort-by (vals groups) (fn (g) (get g :last)))))
     (dissoc groups (get oldest :key))))
 
 (defn add-error (state report)
@@ -227,7 +227,7 @@
 
 (defn errors (&optional (state nil))
   "Every error group, most recently seen first."
-  (reverse (sort-by (vals (get (or state (snapshot)) :errors)) (fn (g) (get g :last)))))
+  (reverse (seq/sort-by (vals (get (or state (snapshot)) :errors)) (fn (g) (get g :last)))))
 
 (defn error-group (id &optional (state nil))
   "The group with `id`, or nil."
@@ -250,7 +250,7 @@
 
 (defn metrics (&optional (state nil))
   "Every metric series, by name then tags."
-  (sort-by (vals (get (or state (snapshot)) :metrics))
+  (seq/sort-by (vals (get (or state (snapshot)) :metrics))
     (fn (s) [(get s :name) (pr-str (get s :tags))])))
 
 (defn summary (&optional (state nil))

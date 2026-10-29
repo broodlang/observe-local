@@ -12,7 +12,7 @@ opinion next to the vendor.
 
 ## Usage
 
-```brood
+```brood fragment
 (observe/start {:provider (observe-local/provider) :app "hive" :env "dev"})
 (observe/attach-all)
 
@@ -24,7 +24,7 @@ opinion next to the vendor.
 
 Both at once in production:
 
-```brood
+```brood fragment
 (observe/fan-out-provider [(observe-local/provider) (observe-appsignal/provider {…})])
 ```
 

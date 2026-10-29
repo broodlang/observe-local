@@ -3,7 +3,7 @@
 ;; second opinion next to a vendor in production.
 (project
   :name "observe-local"
-  :version "0.2.1"
+  :version "0.2.2"
   :brood ">= 0.47.0"
   :description
     "An observe provider that keeps logs, metrics and errors in-process, grouped and bounded, with a hatch page to read them — error_tracker's idea, for everything, without a database."

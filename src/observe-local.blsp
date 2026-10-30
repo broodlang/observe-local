@@ -215,9 +215,9 @@
 
 (impl Provider
   local
-  (ship-logs [p _ records] (do (gen/cast (get p :pid) [:batch :logs records]) :ok))
-  (ship-metrics [p _ metrics] (do (gen/cast (get p :pid) [:batch :metrics metrics]) :ok))
-  (ship-errors [p _ reports] (do (gen/cast (get p :pid) [:batch :errors reports]) :ok)))
+  (ship-logs (p _ records) (do (gen/cast (get p :pid) [:batch :logs records]) :ok))
+  (ship-metrics (p _ metrics) (do (gen/cast (get p :pid) [:batch :metrics metrics]) :ok))
+  (ship-errors (p _ reports) (do (gen/cast (get p :pid) [:batch :errors reports]) :ok)))
 
 (defn provider ()
   "The local provider, over a running keeper (started if need be)."

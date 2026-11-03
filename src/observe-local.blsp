@@ -157,7 +157,7 @@
                  :min value
                  :max value
                  :samples [value]}))
-      :else state)))
+      else state)))
 
 (defn receive-batch (state kind batch)
   "`state` after one shipped batch of `kind`."
@@ -296,7 +296,7 @@
       (< s 60) (str s "s ago")
       (< s 3600) (str (math/quot s 60) "m ago")
       (< s 86400) (str (math/quot s 3600) "h ago")
-      :else (str (math/quot s 86400) "d ago"))))
+      else (str (math/quot s 86400) "d ago"))))
 
 (defn- card (label value &optional (class ""))
   [:div {:class "card"} [:b {:class class} (str value)] [:span {} label]])
@@ -532,7 +532,7 @@
       (= section "logs")
         (shell links title "logs" (logs-page links state (get opts :level :debug)) opts)
       (= section "metrics") (shell links title "metrics" (metrics-page state) opts)
-      :else nil)))
+      else nil)))
 
 (defn handler (&optional (opts {}))
   "A conn handler serving the pages. Mount it twice — on the prefix and on `<prefix>/*path`

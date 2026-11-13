@@ -3,10 +3,10 @@
 ;; second opinion next to a vendor in production.
 (project
   :name "observe-local"
-  :version "0.2.4"
-  :brood ">= 0.51.0"
+  :version "0.2.5"
+  :brood ">= 0.52.0"
   :description
     "An observe provider that keeps logs, metrics and errors in-process, grouped and bounded, with a hatch page to read them — error_tracker's idea, for everything, without a database."
   :repository "https://github.com/broodlang/observe-local"
   ;; hatch is what the page renders and serves with (`web/template`, `web/conn`).
-  :dependencies [[observe :version "^0.2.4"] [hatch :version "^0.31.2"]])
+  :dependencies [[observe :version "^0.2.5"] [hatch :version "^0.31.3"]])
